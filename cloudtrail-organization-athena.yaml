@@ -1,0 +1,709 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# This template sets up an Athena table to query organizational CloudTrail logs, using partition projection.
+
+AWSTemplateFormatVersion: 2010-09-09
+Description: Organization CloudTrail Glue/Athena table
+
+Parameters:
+  OrganizationCloudTrailBucket:
+    Type: String
+    Description: S3 bucket name of the Organization or Control Tower CloudTrail bucket
+
+  AccountIdsBucketPrefix:
+    Type: String
+    Description: > 
+      Bucket prefix containing list of account IDs, without the slash at the end.
+      For Control Tower, use org-id/AWSLogs/org-id    
+      For Organization trail, use org-id/AWSLogs
+    AllowedPattern: .*(?<!/)$ # Do not end with slash
+
+  CloudTrailStartDate:
+    Type: String
+    Description: Estimated date of the first CloudTrail event, in YYYY/MM/DD format
+    AllowedPattern: \d{4}/\d{2}/\d{2}
+
+  GlueDatabaseName:
+    Type: String
+    Default: controltower_cloudtrail_logs
+    Description: >
+      The name to use when creating the Glue Database. 
+      Avoid using hyphens, so that Athena queries do not need to be quoted
+
+  GlueTableName:
+    Type: String
+    Default: cloudtrail
+    Description: Glue Table name
+
+  ConfigureLakeFormationGrants:
+    Type: String
+    Description: Set to no if LakeFormation was not initialized in the account
+    AllowedValues:
+      - "Yes"
+      - "No"
+    Default: "No"
+
+  LakeFormationGrantRoleARN01:
+    Type: String
+    Description: Role ARN for access to the database tables
+    Default: ''
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Required configuration
+        Parameters:
+          - OrganizationCloudTrailBucket
+          - AccountIdsBucketPrefix
+          - CloudTrailStartDate
+
+      - Label:
+          default: (Optional) LakeFormation configuration
+        Parameters:
+          - ConfigureLakeFormationGrants
+          - LakeFormationGrantRoleARN01
+
+      - Label:
+          default: (Optional) Default name overrides
+        Parameters:
+          - GlueDatabaseName
+          - GlueTableName
+
+Conditions:
+  ConfigureLakeFormationGrants: !Equals [!Ref ConfigureLakeFormationGrants, 'Yes'] 
+
+
+Resources:
+
+########
+# Glue #
+########
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: AWS Service log tables
+
+
+  # The schema was built using the same from:
+  # https://docs.aws.amazon.com/athena/latest/ug/cloudtrail-logs.html
+  OrganizationalCloudTrailGlueTable:
+    Type: AWS::Glue::Table
+    Properties: 
+      CatalogId: !Ref "AWS::AccountId"
+      DatabaseName: !Ref GlueDatabase
+      TableInput: 
+        Name: !Ref GlueTableName
+        Description: Organization CloudTrail logs
+        # Needed for QuickSight: 
+        # https://docs.aws.amazon.com/quicksight/latest/user/troubleshoot-athena-glue-table-not-upgraded.html
+        TableType: EXTERNAL_TABLE
+        Parameters:  
+          EXTERNAL: "TRUE"
+          projection.enabled: "true"
+
+          # Date projection:
+          projection.eventdate.type:  "date"
+          projection.eventdate.range: !Sub "${CloudTrailStartDate},NOW"
+          projection.eventdate.format: "yyyy/MM/dd"
+
+          # Region projection:
+          projection.region.type: enum
+          # This will be filled by the Lambda function:
+          projection.region.values: ""
+
+          # Accoutn ID projection:
+          projection.accountid.type: enum
+          # This will be filled by the Lambda function:
+          projection.accountid.values: ""
+
+          # The ${!var} lets !Sub know it's a literal ${var}, rather than a !Ref
+          storage.location.template: !Sub s3://${OrganizationCloudTrailBucket}/${AccountIdsBucketPrefix}/${!accountid}/CloudTrail/${!region}/${!eventdate}
+
+        PartitionKeys: 
+          - Name: accountid
+            Type: string
+          - Name: region
+            Type: string
+          - Name: eventdate
+            Type: string
+        StorageDescriptor: 
+          InputFormat: "com.amazon.emr.cloudtrail.CloudTrailInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat"
+          SerdeInfo:
+            SerializationLibrary: "com.amazon.emr.hive.serde.CloudTrailSerde"
+            Parameters: {
+              "serialization.format": "1"
+            }
+          StoredAsSubDirectories: true
+          Location: !Sub s3://${OrganizationCloudTrailBucket}/${AccountIdsBucketPrefix}
+          Columns:
+            - Name: eventversion
+              Type: string
+                        
+            - Name: useridentity
+              Type: "struct<\
+                  type:string,\
+                  principalid:string,\
+                  arn:string,\
+                  accountid:string,\
+                  invokedby:string,\
+                  accesskeyid:string,\
+                  username:string,\
+                  sessioncontext:struct<\
+                    attributes:struct<\
+                      mfaauthenticated:string,\
+                      creationdate:string\
+                    >,\
+                    sessionissuer:struct<\
+                      type:string,\
+                      principalid:string,\
+                      arn:string,\
+                      accountid:string,\
+                      username:string\
+                    >\
+                  >\
+                >"
+
+            - Name: eventtime
+              Type: string
+
+            - Name: eventsource
+              Type: string
+
+            - Name: eventname
+              Type: string
+
+            - Name: awsregion
+              Type: string
+
+            - Name: sourceipaddress
+              Type: string
+
+            - Name: useragent
+              Type: string
+
+            - Name: errorcode
+              Type: string
+
+            - Name: errormessage
+              Type: string
+
+            - Name: requestparameters
+              Type: string
+
+            - Name: responseelements
+              Type: string
+
+            - Name: additionaleventdata
+              Type: string
+              
+            - Name: requestid
+              Type: string
+              
+            - Name: eventid
+              Type: string
+
+            - Name: resources
+              Type: "array<struct<arn:string,accountid:string,type:string>>"
+
+            - Name: eventtype
+              Type: string
+
+            - Name: apiversion
+              Type: string
+
+            - Name: readonly
+              Type: string
+
+            - Name: recipientaccountid
+              Type: string
+
+            - Name: serviceeventdetails
+              Type: string
+
+            - Name: sharedeventid
+              Type: string
+
+            - Name: vpcendpointid
+              Type: string        
+
+
+##########
+# Athena #
+##########
+
+  AthenaTempBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "athena-cloudtrail-query-results-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true            
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref S3BucketLogs
+        LogFilePrefix: cloudtrail-s3-access-logs
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+
+  AthenaTempBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AthenaTempBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: SecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AthenaTempBucket.Arn
+              - !Sub "${AthenaTempBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  S3BucketLogs:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+
+  S3BucketLogsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3BucketLogs
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Resource: !Sub "${S3BucketLogs.Arn}/*"
+            Condition:
+              ArnLike:
+                'aws:SourceArn': !GetAtt AthenaTempBucket.Arn
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      State: ENABLED
+      Name: "cloudtrail-logs"
+      Description: CloudTrail Athena Workgroup
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub s3://${AthenaTempBucket}/athena/queries/
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+#################
+# LakeFormation #            
+#################
+
+  LakeFormationGrantDatabase:
+    Condition: ConfigureLakeFormationGrants
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal: 
+        DataLakePrincipalIdentifier: !Ref LakeFormationGrantRoleARN01
+      Permissions:
+        - ALTER
+        - CREATE_TABLE
+        - DROP
+      Resource:
+        DatabaseResource:
+          Name: !Ref GlueDatabase              
+
+
+  LakeFormationGrantTable:
+    Condition: ConfigureLakeFormationGrants
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal: 
+        DataLakePrincipalIdentifier: !Ref LakeFormationGrantRoleARN01
+      Permissions:
+        - SELECT
+      Resource:
+        TableResource:
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref OrganizationalCloudTrailGlueTable
+
+
+
+############################
+# Account ID update Lambda #            
+############################
+
+# The projection.accountid.values and projection.region.values above needs to be dynamically updated
+# every day. This Lambda function will find the list of account IDs from the S3 bucket, and update the 
+# Glue table properties accordingly
+
+  GlueCloudTrailTableProjectionAccountIdUpdateRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole      
+      Policies:
+        - PolicyName: S3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                Resource: !Sub arn:${AWS::Partition}:s3:::${OrganizationCloudTrailBucket}
+        - PolicyName: Glue
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'glue:UpdateTable'
+                  - 'glue:GetTable'
+                Resource: 
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/${OrganizationalCloudTrailGlueTable}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                  - !Sub arn:${AWS::Partition}:glue:${AWS::Region}:${AWS::AccountId}:catalog
+        - PolicyName: EC2Regions
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeRegions'
+                Resource: "*"
+        - PolicyName: LakeFormation
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lakeformation:GetDataAccess'
+                # https://docs.aws.amazon.com/lake-formation/latest/dg/access-control-underlying-data.html
+                Resource: "*"
+
+
+  LakeFormationGrantLambda:
+    Condition: ConfigureLakeFormationGrants
+    Type: AWS::LakeFormation::Permissions
+    Properties:
+      DataLakePrincipal: 
+        DataLakePrincipalIdentifier: !GetAtt GlueCloudTrailTableProjectionAccountIdUpdateRole.Arn
+      Permissions:
+        - ALTER
+        - SELECT
+      Resource:
+        TableResource:
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref OrganizationalCloudTrailGlueTable  
+
+
+  GlueCloudTrailTableProjectionAccountIdUpdateLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt GlueCloudTrailTableProjectionAccountIdUpdateRole.Arn
+      Runtime: python3.12
+      Timeout: 300
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref OrganizationCloudTrailBucket
+          BUCKET_PREFIX: !Ref AccountIdsBucketPrefix
+          GLUE_DATABASE: !Ref GlueDatabase
+          GLUE_TABLE: !Ref OrganizationalCloudTrailGlueTable
+      Code:
+        # https://aws.amazon.com/premiumsupport/knowledge-center/cloudformation-s3-notification-lambda/
+        # Lambda function to update the Organization Cloud Trail Glue Table with the account ID and region partitions
+        ZipFile: |
+          import boto3
+          from botocore.config import Config
+          import os
+          from typing import List
+
+          # Environment variables:
+          s3_bucket = os.environ['S3_BUCKET']
+          bucket_prefix = os.environ['BUCKET_PREFIX']
+          glue_database = os.environ['GLUE_DATABASE']
+          glue_table = os.environ['GLUE_TABLE']
+
+          # Boto3 clients:
+          boto3_config = Config(retries={'max_attempts': 10, 'mode': 'standard'})
+          s3 = boto3.client('s3', config=boto3_config)
+          ec2 = boto3.client('ec2', config=boto3_config)
+          glue = boto3.client('glue', config=boto3_config)
+
+          def main():
+            account_ids = get_account_ids_from_bucket()
+            print(f'List of account IDs: {account_ids}')
+
+            regions = get_regions()
+            print(f'List of regions: {regions}')
+
+            glue_set_projection_value('accountid', account_ids)
+            glue_set_projection_value('region', regions)
+
+
+          def lambda_handler(event, context):
+            main()
+
+          def get_account_ids_from_bucket() -> List[str]:
+            '''
+            Gets list of account IDs by listing the Organization CloudTrail bucket
+
+            :return: List of Account ID strings
+            '''
+
+            paginator = s3.get_paginator("list_objects_v2")
+            account_ids = []
+            accountid_prefix = f'{bucket_prefix}/'
+
+            for page in paginator.paginate(
+                    Bucket=s3_bucket,
+                    Prefix=accountid_prefix,
+                    MaxKeys=1000,
+                    Delimiter='/'
+                  ):
+
+              if not 'CommonPrefixes' in page:
+                continue
+              
+              common_prefixes = page['CommonPrefixes']
+              for common_prefix in common_prefixes:
+                prefix = common_prefix['Prefix']
+                # Prefix looks like o-abcd1234/AWSLogs/0123456789/
+                # So minus the accountid_prefix (o-abcd1234/AWSLogs/) from it:
+                account_id = prefix.replace(accountid_prefix, '').replace('/','')
+                # Double check that every character is a number:
+                if not any(char.isdigit() for char in account_id):
+                  print(f'WARNING: Unexpected account ID under prefix {prefix}: {account_id}')
+                  continue
+                account_ids.append(account_id)
+
+            return account_ids
+
+
+          def get_regions() -> List[str]:
+            '''
+            Returns list of AWS regions
+            '''
+            regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
+            return regions
+
+
+          def glue_set_projection_value(projection_name:str, values:List[str]) -> None:
+            '''
+            Set the given value for the projection.{projection_name}.values property, if it's different.
+            '''
+            table = glue.get_table(
+              DatabaseName=glue_database,
+              Name = glue_table,
+            )['Table']
+
+            table_properties = table['Parameters']
+            table_property_name = f'projection.{projection_name}.values'
+            if not table_property_name in table_properties:
+              raise Exception(f'Could not find {table_property_name} in the glue table {glue_database}.{glue_table}')
+            
+            table_property_values = table_properties[table_property_name].split(',')
+            print(f'Glue table {glue_database}.{glue_table} property {table_property_name} currently has the values: {table_property_values}')
+
+            # See if the value to set, and the one right now, is the same (unordered check)
+            if set(table_property_values) == set(values):
+              print(
+                  f'Skipping update for property {table_property_name}, nothing to change.')
+              return
+
+            # Update the table
+            # update_table() only supports updating certain fields
+            # Everything needs to be included, otherwise it will make that field empty:
+            update_fields = [
+              'Name', 'Description', 'Owner', 'LastAccessTime', 'LastAnalyzedTime',
+              'Retention', 'StorageDescriptor', 'PartitionKeys', 'ViewOriginalText',
+              'ViewExpandedText', 'TableType', 'Parameters', 'TargetTable'
+            ]
+            new_table = {}
+            for field in update_fields:
+              if field in table:
+                new_table[field] = table[field]
+
+            value_string = ','.join(values)
+            new_table['Parameters'][table_property_name] = ','.join(values)
+            glue.update_table(
+              DatabaseName = glue_database,
+              TableInput=new_table
+            )
+            print(f'Successfully updated the Glue table {glue_database}.{glue_table} property {table_property_name} with: {value_string}')
+
+            return
+
+  GlueCloudTrailTableProjectionAccountIdUpdateLambdaLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GlueCloudTrailTableProjectionAccountIdUpdateLambda}
+      RetentionInDays: 7
+
+##############################
+# Account ID update schedule #            
+##############################
+
+  GlueCloudTrailTableProjectionAccountIdUpdateSchedule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: "CloudTrail Glue Table update"
+      ScheduleExpression: "rate(1 day)"
+      State: "ENABLED"
+      Targets: 
+        - Arn: !GetAtt GlueCloudTrailTableProjectionAccountIdUpdateLambda.Arn
+          Id: "GlueCloudTrailTableProjectionAccountIdUpdateLambda"
+
+
+  PermissionForEventsToInvokeLambda: 
+    Type: AWS::Lambda::Permission
+    Properties: 
+      FunctionName: !Ref GlueCloudTrailTableProjectionAccountIdUpdateLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt GlueCloudTrailTableProjectionAccountIdUpdateSchedule.Arn
+
+
+##################
+# Trigger Lambda #            
+##################
+
+# Though the schedule runs every day, this triggers the Lambda on the first run.
+
+  TriggerLambda:
+    Type: Custom::TriggerLambda
+    Properties:
+      ServiceToken: !GetAtt TriggerLambdaCustomResourceLambda.Arn
+      FunctionName: !Ref GlueCloudTrailTableProjectionAccountIdUpdateLambda
+
+  TriggerLambdaCustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ lambda.amazonaws.com ]
+            Action: [ sts:AssumeRole ]
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole 
+      Policies:
+        - PolicyName: Lambda
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt GlueCloudTrailTableProjectionAccountIdUpdateLambda.Arn
+
+  TriggerLambdaCustomResourceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt TriggerLambdaCustomResourceRole.Arn
+      Timeout: 300
+      Code: 
+        ZipFile: |
+          import boto3
+          from botocore.config import Config
+          import cfnresponse
+          import traceback
+
+          boto3_config = Config(retries={'max_attempts': 10, 'mode': 'standard'})
+          awslambda = boto3.client('lambda', config=boto3_config)
+
+          def handler(event, context):
+            print(f'event is {event}')
+            response_payload = {}
+            response_status = cfnresponse.FAILED
+            physical_resource_id = 'unset'
+
+            try:
+              if event['RequestType'] == 'Delete':
+                response_status = cfnresponse.SUCCESS
+                
+              elif event['RequestType'] in ('Create','Update'):
+                function_name = event['ResourceProperties']['FunctionName']
+                awslambda.invoke(FunctionName=function_name, InvocationType='Event', Payload=b"{}")
+                response_status = cfnresponse.SUCCESS
+                
+            except Exception as e:
+              print('ERROR: Caught exception:')
+              print(e)
+              traceback.print_exc()
+            finally:
+              print('Sending cfn response')
+              cfnresponse.send(event, context, response_status, response_payload, physical_resource_id)
+
+  TriggerLambdaCustomResourceLambdaLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TriggerLambdaCustomResourceLambda}
+      RetentionInDays: 7
+
+
+###########
+# Outputs #
+###########
+
+Outputs:
+  GlueDatabase:
+    Value: !Ref GlueDatabase
+
+  GlueTable:
+    Value: !Ref OrganizationalCloudTrailGlueTable
+
